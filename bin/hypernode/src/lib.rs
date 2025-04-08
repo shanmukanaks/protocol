@@ -1,6 +1,8 @@
+pub mod fork_watchtower;
 pub mod release_watchtower;
 pub mod swap_watchtower;
 pub mod txn_broadcast;
+use fork_watchtower::ForkWatchtower;
 
 use alloy::primitives::Address;
 pub use alloy::providers::Provider;
@@ -183,6 +185,19 @@ pub async fn run(args: HypernodeArgs) -> Result<()> {
     let proof_generator = proof_generator_handle.await?;
 
     info!("Starting hypernode watchtowers...");
+
+    ForkWatchtower::run(
+        rift_exchange_address,
+        transaction_broadcaster.clone(),
+        evm_rpc.clone(),
+        btc_rpc.clone(),
+        contract_data_engine.clone(),
+        bitcoin_data_engine.clone(),
+        args.btc_batch_rpc_size,
+        proof_generator.clone(),
+        &mut join_set,
+    );
+
     SwapWatchtower::run(
         contract_data_engine.clone(),
         bitcoin_data_engine.clone(),

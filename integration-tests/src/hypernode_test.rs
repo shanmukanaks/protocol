@@ -22,6 +22,7 @@ use rift_sdk::{
     DatabaseLocation,
 };
 use sol_bindings::{RiftExchange, Types::DepositLiquidityParams};
+use std::time::Duration;
 use tokio::signal::{self, unix::signal};
 
 use crate::test_utils::{create_deposit, setup_test_tracing, MultichainAccount};
@@ -371,4 +372,112 @@ async fn test_hypernode_simple_swap() {
     }
     // stop the hypernode
     hypernode_handle.abort();
+}
+
+// cargo test --package integration-tests --lib --release +nightly -- hypernode_test::test_hypernode_fork_detection --exact --show-output
+#[tokio::test]
+#[serial_test::serial]
+async fn test_hypernode_fork_detection() {
+    setup_test_tracing();
+
+    let maker = MultichainAccount::new(1);
+    let taker = MultichainAccount::new(2);
+
+    let (devnet, rift_exchange, deposit_params, maker_account, transaction_broadcaster) =
+        create_deposit(true).await;
+
+    let initial_mmr_root = devnet.contract_data_engine.get_mmr_root().await.unwrap();
+    let initial_leaf_count = devnet.contract_data_engine.get_leaf_count().await.unwrap();
+
+    println!(
+        "initial state before fork: root={}, leaf_count={}",
+        hex::encode(initial_mmr_root),
+        initial_leaf_count
+    );
+
+    let hypernode_account = MultichainAccount::new(3);
+
+    devnet
+        .ethereum
+        .fund_eth_address(hypernode_account.ethereum_address, U256::MAX)
+        .await
+        .unwrap();
+
+    let hypernode_args = HypernodeArgs {
+        evm_ws_rpc: devnet.ethereum.anvil.ws_endpoint_url().to_string(),
+        btc_rpc: devnet.bitcoin.rpc_url_with_cookie.clone(),
+        private_key: hex::encode(hypernode_account.secret_bytes),
+        checkpoint_file: devnet.checkpoint_file_path.clone(),
+        database_location: DatabaseLocation::InMemory,
+        rift_exchange_address: devnet.ethereum.rift_exchange_contract.address().to_string(),
+        deploy_block_number: 0,
+        btc_batch_rpc_size: 100,
+        proof_generator: ProofGeneratorType::Execute,
+    };
+
+    let hypernode_handle = tokio::spawn(async move {
+        hypernode::run(hypernode_args)
+            .await
+            .expect("Hypernode crashed");
+    });
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    println!("mining blocks to create divergence");
+    let num_blocks = 5;
+    devnet.bitcoin.mine_blocks(num_blocks).await.unwrap();
+
+    println!("waiting for fork watchtower to detect and handle divergence");
+
+    let max_retries = 15;
+    let mut fork_handled = false;
+
+    for i in 0..max_retries {
+        let current_mmr_root = devnet.contract_data_engine.get_mmr_root().await.unwrap();
+        let current_leaf_count = devnet.contract_data_engine.get_leaf_count().await.unwrap();
+
+        println!(
+            "poll {}/{}: root={}, leaf_count={}",
+            i + 1,
+            max_retries,
+            hex::encode(current_mmr_root),
+            current_leaf_count
+        );
+
+        if current_mmr_root != initial_mmr_root || current_leaf_count > initial_leaf_count {
+            println!("fork detected and handled!");
+            fork_handled = true;
+            break;
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let bde_root = devnet
+        .bitcoin
+        .data_engine
+        .indexed_mmr
+        .read()
+        .await
+        .get_root()
+        .await
+        .unwrap();
+    let cde_root = devnet.contract_data_engine.get_mmr_root().await.unwrap();
+
+    println!(
+        "final state: BDE root={}, CDE root={}",
+        hex::encode(bde_root),
+        hex::encode(cde_root)
+    );
+
+    assert!(fork_handled, "Fork was not detected and handled");
+
+    assert_eq!(
+        bde_root, cde_root,
+        "BDE and CDE roots should match after fork is handled"
+    );
+
+    hypernode_handle.abort();
+
+    println!("fork watchtower test completed successfully");
 }
